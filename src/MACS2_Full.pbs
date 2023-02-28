@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+
+#PBS -l nodes=1:ppn=4
+#PBS -l walltime=24:00:00
+#PBS -l mem=25gb
+
+# Load the necessary modules
+module load MACS2/2.2.7.1-foss-2021b
+module load Bowtie2/2.4.4-GCC-11.2.0
+module load SAMtools/1.15-GCC-11.2.0
+module load Trimmomatic/0.39-Java-11
+module load MultiQC/1.9-intel-2020a-Python-3.8.2
+module load FastQC/0.11.9-Java-11
+
+# Change to the directory you are working in 
+cd /kyukon/data/gent/vo/000/gvo00095/Courses/AHTA/Group3/ChIPseq
+
+Scratch=/kyukon/scratch/gent/vo/000/gvo00095/vsc45300
+
+mkdir fastqc_trimmed
+
+# Index 
+bowtie2-build --threads 8 ../resources/Homo_sapiens.GRCh38.dna.toplevel.fa Homo_sapiens
+echo "Finsihsed index building"
+echo "start alignment"
+for ID in SRR19522227 SRR19522226 SRR19522225 SRR19522224 SRR19522223 SRR19522212 SRR19522213 SRR19522214 SRR19522215 SRR19522216
+do
+    echo $ID
+    java -jar $EBROOTTRIMMOMATIC/trimmomatic-0.39.jar PE -threads 8 -phred33 $Scratch/$ID\_1.fastq $Scratch/$ID\_2.fastq $Scratch/$ID\_1_trimQuality.fastq $Scratch/$ID\_1un_trimQuality.fastq $Scratch/$ID\_2_trimQuality.fastq $Scratch/$ID\_2un_trimQuality.fastq SLIDINGWINDOW:4:15
+    java -jar $EBROOTTRIMMOMATIC/trimmomatic-0.39.jar SE -threads 8 -phred33 $Scratch/$ID\_2.fastq $Scratch/$ID\_2_trimQuality.fastq SLIDINGWINDOW:4:15
+
+    fastqc --outdir fastqc_trimmed $Scratch/$ID\_1_trimQuality.fastq
+    fastqc --outdir fastqc_trimmed $Scratch/$ID\_2_trimQuality.fastq
+    #./bbmap/repair.sh in1=$Scratch/$ID\_1_trimQuality.fastq in2=$Scratch/$ID\_2_trimQuality.fastq out1=$Scratch/$ID\_1_fixed.fastq out2=$Scratch/$ID\_2_fixed.fastq outsingle=$Scratch/$ID\_singletons.fastq repair
+    # Aligning 
+    bowtie2 -p 4 -x Homo_sapiens -1 $Scratch/$ID\_1_trimQuality.fastq -2 $Scratch/$ID\_2_trimQuality.fastq -S $Scratch/$ID.sam
+
+    # Conversion to bam 
+    samtools view -S -b $Scratch/$ID.sam > $Scratch/$ID.bam
+    samtools sort $Scratch/$ID.bam -o bam/$ID\_sored.bam
+done
+
+echo "Finsihed alignment"
+
+# SRR19522227 - Input control of mock infection r1
+# SRR19522226 - Input control of mock infection r2
+# SRR19522225 - Input control of mock infection r3
+# SRR19522224 - Input control of covid infection r1
+# SRR19522223 - Input control of covid infection r3
+# SRR19522216 - Mock infection r1
+# SRR19522215 - Mock infection r2
+# SRR19522214 - Mock infection r3
+# SRR19522213 - Covid infection r1
+# SRR19522212 - Covid infection r3
+
+macs2 callpeak -t $Scratch/SRR19522214.bam -c $Scratch/SRR19522225.bam -f BAMPE --broad -n Mock_r3 -g hs --broad-cutoff 0.1
+macs2 callpeak -t $Scratch/SRR19522215.bam -c $Scratch/SRR19522226.bam -f BAMPE --broad -n Mock_r2 -g hs --broad-cutoff 0.1
+macs2 callpeak -t $Scratch/SRR19522216.bam -c $Scratch/SRR19522227.bam -f BAMPE --broad -n Mock_r1 -g hs --broad-cutoff 0.1
+macs2 callpeak -t $Scratch/SRR19522213.bam -c $Scratch/SRR19522224.bam -f BAMPE --broad -n Cov_r1 -g hs --broad-cutoff 0.1
+macs2 callpeak -t $Scratch/SRR19522212.bam -c $Scratch/SRR19522223.bam -f BAMPE --broad -n Cov_r2 -g hs --broad-cutoff 0.1
+
+macs2 callpeak -t $Scratch/SRR19522214.bam $Scratch/SRR19522215.bam $Scratch/SRR19522216.bam -c $Scratch/SRR19522225.bam $Scratch/SRR19522226.bam $Scratch/SRR19522227.bam -f BAMPE --broad -n peaks/Mock -g hs --broad-cutoff 0.1
+macs2 callpeak -t $Scratch/SRR19522212.bam $Scratch/SRR19522213.bam -c $Scratch/SRR19522223.bam $Scratch/SRR19522224.bam -f BAMPE --broad -n peaks/CoV -g hs --broad-cutoff 0.1
+
+multiqc .
+

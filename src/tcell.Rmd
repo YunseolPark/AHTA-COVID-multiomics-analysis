@@ -1,0 +1,406 @@
+---
+output:
+  pdf_document:
+    number_sections: true
+    dev: png
+    latex_engine: xelatex
+header-includes: \setlength{\emergencystretch}{3em}
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center')
+knitr::opts_chunk$set(out.width = '100%')
+knitr::opts_chunk$set(fig.width=12, fig.height=8)
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(message=FALSE)
+```
+
+# Load libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(biomaRt)
+  library(dplyr)
+  library(tximport)
+  library(edgeR)
+  library(msqrob2)
+  library(ggplot2)
+  library(gridExtra)
+  library(WebGestaltR)
+})
+```
+
+# Pseudoount table
+
+## Human annotation data
+```{r}
+#annotation data
+hs_annot <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+#attributes of annotation data
+attributes <- listAttributes(hs_annot)
+
+data <- getBM(attributes = c('ensembl_gene_id', 'ensembl_transcript_id', 
+                             'external_gene_name'), mart = hs_annot)
+
+tx2geneGtf <- dplyr::select(data, ensembl_transcript_id, ensembl_gene_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, TXNAME = ensembl_transcript_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, GENEID = ensembl_gene_id)
+
+head(tx2geneGtf)
+```
+
+## Generate pseudocount table
+
+```{r}
+# Get file locations
+tcell_files <- list.files("data/RNAseq_tcell/")
+tcell_files <- tcell_files[grep("abundance.tsv",tcell_files)]
+tcell_samples <- unlist(strsplit(tcell_files,"_"))[c(1:length(tcell_files))*2-1]
+tcell_files <- paste(rep("data/RNAseq_tcell/",length(tcell_files)),tcell_files,sep="")
+names(tcell_files) <- tcell_samples
+
+# Load RNAseq data
+tcell_txi <- tximport(tcell_files, type = "kallisto", tx2gene = tx2geneGtf)
+head(tcell_txi$counts)
+dim(tcell_txi$counts)
+```
+
+# Annotation
+
+Sample annotation. Our interest mainly lies in the difference between expression profiles based on severity of the disease.
+
+```{r}
+# Load annotation data and manipulate to fit the analysis
+tcell_annotation <- read.table('tcell_annotation.txt', header=T, sep=',')
+tcell_annotation <- dplyr::filter(tcell_annotation, Run %in% tcell_samples)
+tcell_annotation$Severity[tcell_annotation$
+                            Severity=="hospitalized moderate to severe"] <- 'Infected'
+print(tcell_annotation[c("Run", "Severity", "Organism", "Tissue", "Cell_type", 
+                         "AvgSpotLen","Instrument", "LibraryLayout")])
+# Annotation for design matrix
+tcell_condition <- as.factor(tcell_annotation$Severity)
+```
+
+# Preprocessing
+
+## Check for duplicate rows
+```{r}
+sum(duplicated(rownames(tcell_txi$counts)))
+```
+
+As no duplicates were found, we move on with the analysis.
+
+# Statistical Analysis
+
+## Normalization
+
+```{r}
+# MAke edgeR-comapatible tpm values
+tcell_cts <- tcell_txi$counts
+tcell_normMat <- tcell_txi$length
+# Calculate scaling factors
+tcell_normMat <- tcell_normMat/exp(rowMeans(log(tcell_normMat)))
+tcell_normCts <- tcell_cts/tcell_normMat
+# Calculate effective library sizes
+tcell_eff.lib <- calcNormFactors(tcell_normCts) * colSums(tcell_normCts)
+# Combine effective library sizes with length factors
+tcell_normMat <- sweep(tcell_normMat, 2, tcell_eff.lib, "*")
+# Calculate offsets
+tcell_normMat <- log(tcell_normMat)
+```
+
+## Library sizes
+```{r}
+# Effective library sizes
+tcell_eff.lib
+boxplot(tcell_eff.lib~tcell_condition,xlab="group",ylab="library size")
+jpeg("images/tcell_libsize.jpg")
+boxplot(tcell_eff.lib~tcell_condition,xlab="group",ylab="library size")
+dev.off()
+```
+
+The boxplot shows that there is no significant difference in library effect sizes between healthy donors and COVID-19 patients.
+
+### Wilcox test
+```{r}
+# Wilcox rank sum test for effective library sizes
+wilcox.test(tcell_eff.lib~tcell_condition)
+```
+
+The wilcox rank sum test gives a p-value of 0.9372, which is above 0.05.
+Therefore, we cannot reject the null hypothesis, which states that the median of library effect sizes are equal.
+
+## DGEList object
+
+```{r}
+tcell_y <- DGEList(tcell_cts)
+tcell_y <- scaleOffset(tcell_y, tcell_normMat)
+```
+
+## Filtering on counts
+```{r}
+tcell_cutoff <- 3/(mean(tcell_y$samples$lib.size)/1000000)
+tcell_keep <- rowSums(edgeR::cpm(tcell_y)>tcell_cutoff) >= 3
+tcell_y <- tcell_y[tcell_keep, ,keep.lib.sizes=FALSE]
+summary(tcell_keep)
+```
+We remove 40298 genes with low counts,
+
+## MDS plot
+```{r}
+par(mar=c(6,6,6,6))
+plotMDS.DGEList(tcell_y,col=as.double(sort(unique(tcell_condition))))
+par(xpd=T)
+legend(par("usr")[2]*-1.4,par("usr")[4]*1,sort(unique(tcell_condition)),
+       pch=c(16),col=as.double(sort(unique(tcell_condition))))
+```
+
+There does not seem to be a clear separation of log fold changes between healthy donors and COVID-19 patients.
+Furthermore, a lot of the samples, regardless of infection, seem to group together at one region. This could be due to some confounder, but as the authors of the dataset did not enclose any patient information, it cannot be determined.
+
+# Differential Expression Analysis
+
+## Make design matrix
+```{r}
+tcell_design <- model.matrix(~tcell_condition)
+rownames(tcell_design) <- colnames(tcell_y)
+tcell_design
+```
+
+## Calculate dispersion
+```{r}
+tcell_y <- estimateDisp(tcell_y,tcell_design)
+plotBCV(tcell_y)
+```
+
+The dispersion contains high variation (up to around 1.4 - above 0.4), but this applies to low log CPM values below 4.
+Therefore, the biological variation in the data is acceptable.
+
+## Quasi-likelihood test
+```{r}
+# Make contrast for quasi-likelihood test
+tcell_contrast <- makeContrast("tcell_conditionInfected=0", 
+                               parameterNames=colnames(tcell_design))
+tcell_fit <- glmQLFit(tcell_y,tcell_design)
+tcell_qlf <- glmQLFTest(tcell_fit, contrast=tcell_contrast)
+tcell_toptable <- topTags(tcell_qlf,n=nrow(tcell_qlf$table))$table
+head(tcell_toptable)
+sum(tcell_toptable$FDR < 0.05)
+```
+There are 95 differentially expressed genes with FDR below 0.05.
+
+
+## Addition of gene symbols
+
+### Get gene symbols
+
+```{r}
+data_sorted <- data[sort(data$ensembl_gene_id,index.return=T)$ix,]
+data_sorted <- data_sorted[!duplicated(data_sorted$ensembl_gene_id),]
+```
+
+### Add gene symbols to `toptable`
+
+```{r}
+tcell_toptable <- cbind(rownames(tcell_toptable),tcell_toptable)
+colnames(tcell_toptable)[1] <- "Ensembl_gene_id"
+tcell_toptable_sorted <- tcell_toptable[sort(tcell_toptable$Ensembl_gene_id,
+                                             index.return=T)$ix,]
+tcell_data_sorted <- data_sorted[data_sorted$ensembl_gene_id%in%
+                                  tcell_toptable_sorted$Ensembl_gene_id,]
+dim(tcell_toptable)
+dim(tcell_data_sorted)
+tcell_toptable_sorted$Gene_symbol <- tcell_data_sorted$external_gene_name
+head(tcell_toptable_sorted)
+```
+
+### Resort data
+
+```{r}
+tcell_toptable <- tcell_toptable_sorted[sort(
+                                tcell_toptable_sorted$PValue,index.return=T)$ix,]
+```
+
+### Explore and save results
+
+```{r}
+head(tcell_toptable[,c(1,7,2,5,6)],10)
+write.table(tcell_toptable,file="result/tcell_toptable.txt",col.names=T,
+            row.names=F,sep="\t",quote=F)
+tcell_toptable_sign <- tcell_toptable[tcell_toptable$FDR<0.05,]
+dim(tcell_toptable_sign)
+head(tcell_toptable_sign,10)
+dim(tcell_toptable_sign[tcell_toptable_sign$logFC>0,])
+dim(tcell_toptable_sign[tcell_toptable_sign$logFC<0,])
+```
+
+Around 0.4% (95 out of 22405) of genes were differentially expressed at FDR below 0.05.
+
+## Plots
+### MA plot
+```{r}
+with(tcell_toptable,plot(logCPM,logFC,pch=16,cex=0.2))
+# MAplot: all data points
+with(tcell_toptable,points(logCPM[FDR<0.05],logFC[FDR<0.05],pch=16,col="red",cex=0.6))
+# MA-plot: significant loci
+abline(0,0)
+```
+
+### P-value distribution
+```{r}
+hist(tcell_toptable$PValue)
+```
+
+The p-value distribution is not uniformly distributed.
+
+### Boxplots of top 20 loci
+```{r}
+par(mfrow=c(4,5))
+tcell_counts_k <- tcell_txi$counts[tcell_keep,]
+for (i in 1:20){
+  tcell_counts_part <- as.numeric(edgeR::cpm(tcell_y)[rownames(tcell_counts_k)
+                                                  ==rownames(tcell_toptable)[i],])
+  tcell_boxplot <- data.frame(counts=tcell_counts_part,group=tcell_condition)
+  if (tcell_toptable$Gene_symbol[i]!=""){
+    boxplot(counts~group,tcell_boxplot,main=paste(rownames(tcell_toptable)[i],
+                                                  " (", 
+                                                  tcell_toptable$Gene_symbol[i],
+                                                  ")",sep=""))
+  } else {
+    boxplot(counts~group,tcell_boxplot,main=paste(rownames(tcell_toptable)[i], 
+                                                  " (NA)", sep=""))
+  }
+}
+```
+
+There is a clear separation between the two groups.
+
+Some are very clearly divided, such as gene JPT1, but there are also some that does seem slightly problematic.
+There are some boxplots that show high variation of counts.
+For  example, the healthy counts of gene PLK2 has very long whiskers that reach to almost the median of the infected counts.
+Another example is the boxplot of gene XIST. The box of the healthy counts span from near 0 to over 400.
+This has large variation is in the interquantile range.
+
+While the results may be dubious, the sample size is small, which may give this result.
+Furthermore, even with high variation, the difference between the two groups are still quite visible.
+
+To look into the two examples of genes where the boxplots were dubious, we plot them into violin plots.
+
+### Violin plots of top 20 loci
+```{r}
+# Violin plot of gene PLK2
+tcell_counts_plk2 <- as.numeric(edgeR::cpm(tcell_y)
+                                [rownames(tcell_toptable[tcell_toptable$Gene_symbol
+                                                         =="PLK2",]),])
+tcell_boxplot_plk2 <- data.frame(counts=tcell_counts_plk2,group=tcell_condition)
+violin_plk2 <- ggplot(tcell_boxplot_plk2, aes(x=group, y=counts, fill=group)) +
+               ggtitle(paste(rownames(tcell_toptable[tcell_toptable$Gene_symbol
+                                                     =="PLK2",]), 
+                             " (", "PLK2", ")",sep="")) + 
+               geom_violin()
+# Violin plot of gene XIST
+tcell_counts_xist <- as.numeric(edgeR::cpm(tcell_y)
+                                [rownames(tcell_toptable[tcell_toptable$Gene_symbol
+                                                         =="XIST",]),])
+tcell_boxplot_xist <- data.frame(counts=tcell_counts_xist,group=tcell_condition)
+violin_xist <- ggplot(tcell_boxplot_plk2, aes(x=group, y=counts, fill=group)) +
+               ggtitle(paste(rownames(tcell_toptable[tcell_toptable$Gene_symbol
+                                                     =="XIST",]), 
+                             " (", "XIST", ")",sep="")) + 
+               geom_violin()
+grid.arrange(violin_plk2, violin_xist, nrow = 1)
+```
+
+The violin plot shows similar variation as seen in the boxplots.
+And it shows that there is high variation and small density, shown in gene XIST.
+This is most likely due to the small sample size.
+
+### Volcano plot
+```{r}
+with(tcell_toptable,plot(logFC,-log10(PValue),pch=16,cex=0.2))
+with(tcell_toptable,points(logFC[FDR<0.05 & abs(logFC)>1.5],
+                           -log10(PValue)[FDR<0.05 & abs(logFC)>1.5],
+                           pch=16,col="red",cex=0.6))
+abline(0,0)
+```
+
+The volcano plot shows similar result as the MA plot.
+There are almost similar amount of up- and down-regulated genes.
+
+# Gene set analysis
+
+Gene set analysis is performed to get more insight into the results.
+Specifically, we make use of overrepresentation analysis (ORA).
+
+## Annotation
+
+For annotation, the `data` from Section 1, human annotation, is used.
+Duplicated ensembl gene IDs are removed and the data is saved in `.txt` file.
+```{r}
+if(!file.exists("RefGenes.txt")){
+  refgenes <- data[!duplicated(data$ensembl_gene_id),]
+  refgenes <- refgenes[c("ensembl_gene_id")]
+  write.table(refgenes,file="RefGenes.txt", col.names=c("Ensembl_gene_id"), 
+              row.names=F, quote=F, sep='\t')
+}
+```
+
+
+## Gene set analysis using custom gene sets
+
+### Make `gmt` file for `WebGestaltR`
+
+The file format `gmt` should contain the gene sets.
+
+```{r}
+if (!file.exists("geneset_full.gmt")){
+  geneset <- read.csv("geneset_full.csv", header=F)
+  write.table(geneset, file="geneset_full.gmt",col.names=T,row.names=F,sep="\t",
+              quote=F,na="")
+}
+```
+
+### Run `WebGestaltR`
+
+```{r, eval=FALSE}
+tcell_enrichResult_full <- WebGestaltR(enrichMethod="ORA",
+                            organism="hsapiens",
+                            enrichDatabase="others",
+                            enrichDatabaseFile="geneset_full.gmt",
+                            enrichDatabaseType="genesymbol",
+                            interestGeneFile="result/tcell_toptable.txt",
+                            interestGeneType="ensembl_gene_id",
+                            referenceGeneFile="RefGenes.txt",
+                            referenceGeneType="ensembl_gene_id",
+                            sigMethod="fdr",
+                            fdrThr=0.05,
+                            outputDirectory='result',
+                            projectName = 'ORA_tcell',
+                            is.ouput=TRUE)
+```
+
+## Gene set analysis using KEGG pathway
+
+```{r, eval=FALSE}
+tcell_enrichResult_kegg <- WebGestaltR(enrichMethod="ORA",
+                            organism="hsapiens",
+                            enrichDatabase="pathway_KEGG",
+                            interestGeneFile="result/tcell_toptable.txt",
+                            interestGeneType="ensembl_gene_id",
+                            referenceGeneFile="RefGenes.txt",
+                            referenceGeneType="ensembl_gene_id",
+                            sigMethod="fdr",
+                            fdrThr=0.05,
+                            outputDirectory='result',
+                            projectName = 'ORA_tcell_kegg',
+                            is.ouput=TRUE)
+```
+
+### Genes found from gene set analysis
+
+```{r}
+#overlap_genes <- unique(unlist(strsplit(tcel_enrichResult_kegg$userID, split=';')))
+#top_genesets <- tcell_enrichResult_kegg[tcell_enrichResult_kegg$description %in% c("Endocytosis", "Apoptosis", "Human T-cell leukemia virus 1 infection", "Thermogenesis", #"	Lysosome", "Sphingolipid signaling pathway", "FoxO signaling pathway", "Oxytocin signaling pathway", "Ribosome", "Protein processing in endoplasmic reticulum")]
+#top_overlaps <- unique(unlist(strsplit(top_genesets$userID, split=';')))
+```

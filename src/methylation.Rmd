@@ -1,0 +1,344 @@
+---
+output:
+  pdf_document:
+    number_sections: true
+    dev: png
+    latex_engine: xelatex
+header-includes: \setlength{\emergencystretch}{3em}
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center')
+knitr::opts_chunk$set(out.width = '100%')
+knitr::opts_chunk$set(fig.width=12, fig.height=8)
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(message=FALSE)
+```
+
+# Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(GEOquery)
+  library(wateRmelon)
+  library(dplyr)
+  library(msqrob2)
+  library(ChAMPdata)
+})
+```
+
+# Intensity values
+
+```{r}
+infdata <- readEPIC("data/methylation") 
+```
+
+
+```{r}
+dim(betas(infdata))
+```
+
+```{r}
+head(betas(infdata))
+```
+
+```{r}
+dim(exprs(infdata))
+```
+
+```{r}
+head(exprs(infdata))
+```
+
+
+# Annotation
+
+We will be investigating differential DNA methylation between samples from patients with different disease states.
+
+```{r}
+# Read table and clean up
+meth_annotation <- getGEO(filename="GSE179325_series_matrix.txt.gz")
+meth_annotation <- pData(meth_annotation)
+meth_annotation <- meth_annotation %>% 
+  dplyr::rename(Disease_state = `disease state:ch1`,
+                Tissue_type = `tissue/cell type:ch1`,
+                Organism = `organism_ch1`,
+                Age = `age:ch1`,
+                Gender = `gender:ch1`)
+meth_files <- list.files("data/methylation/")
+meth_files <- meth_files[grep("Grn.idat",meth_files)]
+meth_samples <- unlist(strsplit(meth_files,"_") %>% vapply('[','',1))
+meth_annotation <- dplyr::filter(meth_annotation, geo_accession %in% meth_samples)
+```
+
+```{r}
+# Annotation data
+print(meth_annotation[c("geo_accession", "Disease_state", "Age", "Gender", 
+                        "Tissue_type", "Organism")])
+```
+
+# Preprocessing
+
+## Remove NA values
+
+```{r}
+infdata <- infdata[rowSums(is.na(exprs(infdata)))==0,]
+```
+
+## Filtering
+
+```{r}
+#Remove probes for which calling p-value is insufficient
+infdata.pf <- pfilter(infdata)
+#change sample names
+sampleNames(infdata) <- paste(meth_annotation["geo_accession"][,1],
+                              meth_annotation["Disease_state"][,1],sep="_")
+```
+17430 sites were removed as beadcount <3 in 5% of samples.
+And no sites had 1% of samples with a detection p-value greater than 0.05.
+
+## Degree of methylation between groups
+
+```{r}
+boxplot(betas(infdata),las=2)
+```
+
+There does not seem to be a big difference between groups.
+
+We perform a t-test to confirm.
+
+```{r}
+meth_mean_SEVERE <- rep(0,5)
+meth_mean_NEGATIVE <- rep(0,5)
+n <- 1
+m <- 1
+for (i in 1:ncol(infdata)){
+  if (meth_annotation["Disease_state"][,1][i] == "SEVERE"){
+  meth_mean_SEVERE[n] <- mean(betas(infdata)[,i])
+  n <- n + 1
+  } 
+  else {
+  meth_mean_NEGATIVE[m] <- mean(betas(infdata)[,i])
+  m <- m + 1
+}
+}
+```
+
+```{r}
+t_test_res <- t.test(meth_mean_SEVERE,meth_mean_NEGATIVE)
+t_test_res
+```
+
+The t-test also shows the same result as the previous box plot.
+The p-value is 0.9924, above 0.05. Therefore, we cannot reject null hypothesis, which states that there is no difference between groups in terms of average methylation.
+
+```{r}
+dat_boxplot <- data.frame(betas = c(meth_mean_NEGATIVE, meth_mean_SEVERE),
+                                    group = meth_annotation$Disease_state)
+par(mfrow=c(1,2))
+boxplot(betas~group,dat_boxplot,las=2)
+boxplot(betas~group,dat_boxplot,las=2,ylim=c(0,1))
+```
+
+The box plots also show that there is little difference between average methylation levels between groups. 
+
+## Normalisation & Quality Control
+
+```{r}
+# Perform normalization including dye color adjustment
+infdata.dasen.pf <- dasen(infdata.pf)
+# Make methylumi objects to check density and color bias adjustment
+infdataM <- as(infdata.pf, "MethyLumiM")
+infdataN <- as(infdata.dasen.pf, "MethyLumiM")
+```
+
+```{r}
+# Make QC plot
+par(mfrow=c(2,2))
+plotColorBias1D(infdataM,channel="both",main="before")
+plotColorBias1D(infdataN,channel="both",main="after")
+density(infdataM,xlab="M-value",main="before")
+density(infdataN,xlab="M-value",main="after")
+```
+
+# Differential analysis
+
+## MDS plot
+
+```{r}
+disease <- as.factor(meth_annotation$Disease_state)
+par(mar=c(6,6,6,6))
+plotMDS(infdataN, labels=paste(meth_annotation$Gender,meth_annotation$Age,sep='-'),
+        col=as.double(disease))
+par(xpd=T)
+legend(par("usr")[2]*-0.5,par("usr")[4]*1,sort(unique(disease)),
+       pch=c(16),col=as.double(sort(unique(disease))))
+```
+
+There seems to be quite a big gender effect in the samples.
+
+Surprisingly, there does not seem to be a big age effect. However, only a few samples are used in the analysis.
+And in the paper of the dataset, the authors report that they find a large age effect, larger than that of the gender effect.
+
+Therefore, we add both gender and age as the confounding factor.
+
+## Design matrix
+
+```{r}
+disease <- as.factor(meth_annotation$Disease_state)
+age <- as.numeric(meth_annotation$Age)
+gender <- as.factor(meth_annotation$Gender)
+```
+
+```{r}
+design <- model.matrix(~disease+gender+age)
+design
+```
+
+We do not consider interaction terms so the analysis does not become too complex.
+
+```{r}
+cont.matrix <- makeContrast("diseaseSEVERE=0", parameterNames = colnames(design))
+cont.matrix
+```
+
+## Limma
+
+```{r}
+fit <- lmFit(infdataN,design)
+fit2 <- contrasts.fit(fit,cont.matrix)
+fit2 <- eBayes(fit2)
+```
+
+## Results
+
+```{r}
+# DE results
+LIMMAout <- topTable(fit2,adjust="BH",number=nrow(exprs(infdataN)))
+head(LIMMAout)
+## Check M-values for top results
+exprs(infdataN)[rownames(infdataN)%in%rownames(head(LIMMAout)),]
+```
+
+
+# Plots
+
+## Volcano plot
+
+```{r}
+volcano<- ggplot(LIMMAout,aes(x=logFC,y=-log10(P.Value),color=adj.P.Val < 0.05)) + 
+          geom_point() + scale_color_manual(values=c("black","red"))
+print(volcano)
+```
+
+## MA plot
+
+
+```{r}
+MA<- ggplot(LIMMAout,aes(x=AveExpr,y=logFC,color=adj.P.Val < 0.05)) + 
+            geom_point() + scale_color_manual(values=c("black","red"))
+print(MA)
+```
+
+# Functional annotation of results
+
+## Load annotation
+
+```{r}
+data("probe.features.epic")
+annotation_MA <- probe.features
+print(head(annotation_MA))
+```
+
+## Check annotation
+
+```{r}
+# sort probes
+annotation_MA <- annotation_MA[sort(rownames(annotation_MA),index.return=T)$ix,]
+# Check if all probes are present in both sets
+dim(LIMMAout)
+dim(annotation_MA)
+sum(LIMMAout$Probe_ID%in%rownames(annotation_MA))
+sum(rownames(annotation_MA)%in%LIMMAout$Probe_ID)
+```
+
+The dimensions for the annotation is not the same as our output, so we remove probes not found in our results.
+
+```{r}
+annotation_MA <- annotation_MA[rownames(annotation_MA)%in%LIMMAout$Probe_ID,]
+dim(annotation_MA)
+```
+
+## Annotate results
+
+```{r}
+# Sort LIMMA output alphabetically on probe name
+LIMMAout_sorted <- LIMMAout[sort(LIMMAout$Probe_ID,index.return=T)$ix,]
+# Add gene names to LIMMA output
+LIMMAout_sorted$Gene <- annotation_MA$gene
+LIMMAout_sorted$Feature <- annotation_MA$feature
+LIMMAout_sorted$Chrom <- annotation_MA$CHR
+LIMMAout_sorted$Pos <- annotation_MA$MAPINFO
+LIMMAout_sorted$Chrom <- as.character(LIMMAout_sorted$Chrom)
+LIMMAout_sorted$Gene <- as.character(LIMMAout_sorted$Gene)
+LIMMAout_sorted$Feature <- as.character(LIMMAout_sorted$Feature)
+```
+
+# Quantification of absolute methylation differences
+
+```{r}
+dim(LIMMAout_sorted)
+dim(betas(infdata.dasen.pf))
+```
+
+The dimensions are the same, so we move on.
+
+## Add gene names
+
+```{r}
+LIMMAout_sorted$SEVERE_meth <- rowMeans(betas(infdata.dasen.pf)[rownames(infdata.dasen.pf)
+    %in%LIMMAout_sorted$Probe_ID, meth_annotation["Disease_state"][,1]=="SEVERE"])
+LIMMAout_sorted$NEGATIVE_meth <- rowMeans(betas(infdata.dasen.pf)[rownames(infdata.dasen.pf)
+    %in%LIMMAout_sorted$Probe_ID, meth_annotation["Disease_state"][,1]=="NEGATIVE"])
+LIMMAout_sorted$Abs_diff_meth <- abs(rowMeans(betas(infdata.dasen.pf)[rownames(infdata.dasen.pf)
+    %in%LIMMAout_sorted$Probe_ID, meth_annotation["Disease_state"][,1]=="SEVERE"]) -
+    rowMeans(betas(infdata.dasen.pf)[rownames(infdata.dasen.pf)
+    %in%LIMMAout_sorted$Probe_ID, meth_annotation["Disease_state"][,1]=="NEGATIVE"]))
+```
+
+We also sort the results again on p-values.
+
+```{r}
+LIMMAout_annot <- LIMMAout_sorted[sort(LIMMAout_sorted$P.Value,index.return=T)$ix, 
+                                  c(1,12,13,10,11,4,7,8,5,14,15,16)]
+```
+
+# Interpretation
+
+## Genic regions
+
+```{r}
+sum(LIMMAout_annot$adj.P.Val<0.05)
+sum(LIMMAout_annot$adj.P.Val[LIMMAout_annot$Gene!=""]<0.05)
+head(LIMMAout_annot[c(4,5,6,8,10,11,12)])
+```
+
+```{r}
+LIMMAout_annot_gene <- LIMMAout_annot[LIMMAout_annot$Gene!="",]
+checkMeth <- LIMMAout_annot_gene %>% filter(adj.P.Val < 0.05 & 
+                                              abs(LIMMAout_annot_gene$logFC)>2)
+checkMeth[c(4,5,6,8,10,11,12)]
+```
+
+We only find 1 differentially methylated site, at gene `FAM38A`.
+
+## Promoter regions
+
+```{r}
+LIMMAout_annot_prom <- LIMMAout_annot_gene[grepl("TSS",LIMMAout_annot_gene$Feature) | 
+                                        (LIMMAout_annot_gene$Feature=="1stExon"),]
+head(LIMMAout_annot_prom)
+head(LIMMAout_annot_prom %>% filter(LIMMAout_annot_prom$adj.P.Val<0.1))
+```
+
+We have no differentially methylated promoter regions.
+

@@ -1,0 +1,362 @@
+---
+output:
+  pdf_document:
+    number_sections: true
+    dev: png
+    latex_engine: xelatex
+header-includes: \setlength{\emergencystretch}{3em}
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center')
+knitr::opts_chunk$set(out.width = '100%')
+knitr::opts_chunk$set(fig.width=12, fig.height=8)
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(message=FALSE)
+```
+
+# Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(biomaRt)
+  library(dplyr)
+  library(tximport)
+  library(edgeR)
+  library(msqrob2)
+  library(WebGestaltR)
+})
+```
+
+# PseudoCount table
+
+## Human annotation data
+```{r}
+#annotation data
+hs_annot <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+#attributes of annotation data
+attributes <- listAttributes(hs_annot)
+
+data <- getBM(attributes = c('ensembl_gene_id', 'ensembl_transcript_id', 
+                             'external_gene_name'),
+              mart = hs_annot)
+
+tx2geneGtf <- dplyr::select(data, ensembl_transcript_id, ensembl_gene_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, TXNAME = ensembl_transcript_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, GENEID = ensembl_gene_id)
+
+head(tx2geneGtf)
+```
+
+# Load data
+```{r}
+# Get file locations
+blood_files <- list.files("data/RNAseq_blood/")
+blood_files <- blood_files[grep("abundance.tsv",blood_files)]
+blood_samples <- unlist(strsplit(blood_files,"_"))[c(1:length(blood_files))*2-1]
+blood_files <- paste(rep("data/RNAseq_blood/",length(blood_files)),blood_files,sep="")
+names(blood_files) <- blood_samples
+
+# Load RNAseq data
+blood_txi <- tximport(blood_files, type = "kallisto", tx2gene = tx2geneGtf)
+head(blood_txi$counts)
+dim(blood_txi$counts)
+```
+
+# Annotation
+
+Sample annotation. Our interest mainly lies in the difference between expression profiles based on severity of the disease.
+
+```{r}
+# Load annotation data and manipulate to fit the analysis
+blood_annotation <- read.table("monocyte_sra.txt", sep=',', header=T)
+blood_annotation <- dplyr::filter(blood_annotation, Run %in% blood_samples)
+blood_annotation["Condition"] <- t(t(t(blood_annotation["Condition"]) %>% 
+                                       strsplit(" ") %>% vapply("[","",1)))
+print(blood_annotation[c("Run", "Sample.Name", "Condition", "AvgSpotLen", 
+                         "Organism", "source_name", "Instrument", "LibraryLayout")])
+# Annotation for design matrix
+blood_condition <- as.factor(t(blood_annotation["Condition"]))
+#blood_patient <- as.factor(t(blood_annotation["Sample.Name"]))
+```
+
+# Preprocessing
+
+## Check for duplicate rows
+```{r}
+sum(duplicated(rownames(blood_txi$counts)))
+```
+
+As no duplicates were found, we move on with the analysis.
+
+# Statistical Analysis
+
+## Normalization
+
+```{r}
+# Make edgeR-comapatible tpm values
+blood_cts <- blood_txi$counts
+blood_normMat <- blood_txi$length
+# Calculate scaling factors
+blood_normMat <- blood_normMat/exp(rowMeans(log(blood_normMat)))
+blood_normCts <- blood_cts/blood_normMat
+# Calculate effective library sizes
+blood_eff.lib <- calcNormFactors(blood_normCts) * colSums(blood_normCts)
+# Combine effective library sizes with length factors
+blood_normMat <- sweep(blood_normMat, 2, blood_eff.lib, "*")
+# Calculate offsets
+blood_normMat <- log(blood_normMat)
+```
+
+### Library sizes
+```{r}
+# Effective library sizes
+blood_eff.lib
+boxplot(blood_eff.lib~blood_condition,xlab="group",ylab="library size")
+# Wilcox rank sum test for effective library sizes
+wilcox.test(blood_eff.lib~blood_condition)
+```
+
+Although the medians for library sizes between the two groups may seem different at first glance, there is quite a lot of variation.
+
+Furhtermore, we see that the p-value of Wilcox rank sum test is 1, much larger than 0.05.
+Therefore, we cannot reject the null hypothesis that the medians are the same.
+
+## DGEList object
+
+```{r}
+blood_y <- DGEList(blood_cts)
+blood_y <- scaleOffset(blood_y, blood_normMat)
+```
+
+## Filtering on counts
+```{r}
+blood_cutoff <- 3/(mean(blood_y$samples$lib.size)/1000000)
+blood_keep <- rowSums(edgeR::cpm(blood_y)>blood_cutoff) >= 3
+blood_y <- blood_y[blood_keep, ,keep.lib.sizes=FALSE]
+summary(blood_keep)
+```
+
+We remove 29452 rows (genes), almost 50% of the entire dataset.
+
+## MDS plot
+```{r}
+par(mar=c(6,6,6,6))
+plotMDS.DGEList(blood_y,col=as.double(sort(unique(blood_condition))))
+par(xpd=T)
+legend(par("usr")[2]*-1.4,par("usr")[4]*1,sort(unique(blood_condition)),
+       pch=c(16),col=as.double(sort(unique(blood_condition))))
+```
+
+There does not seem to be a clear separation of log fold changes between healthy donors and COVID-19 patients.
+
+It does seem, however, that COVID-19 patients' samples tend to be grouped together in the bottom of the MDS plot.
+Of course, due to the randomness of the healthy donors, we cannot say for sure that this is due to any effect.
+
+# Differential Expression Analysis
+
+## Make design matrix
+```{r}
+blood_design <- model.matrix(~blood_condition)
+rownames(blood_design) <- colnames(blood_y)
+blood_design
+```
+
+## Calculate dispersion
+```{r}
+blood_y <- estimateDisp(blood_y,blood_design)
+plotBCV(blood_y)
+```
+
+The dispersion contains high variation (around 1.0 - above 0.4), but this applies to low log CPM values below 4.
+Therefore, the biological variation in the data is acceptable.
+
+
+## Quasi-likelihood test
+```{r}
+# Make contrast for quasi-likelihood test
+blood_contrast <- makeContrast("-blood_conditionHealthy=0", 
+                               parameterNames = colnames(blood_design))
+blood_fit <- glmQLFit(blood_y,blood_design)
+blood_qlf <- glmQLFTest(blood_fit,contrast=blood_contrast)
+blood_toptable <- topTags(blood_qlf,n=nrow(blood_qlf$table))$table
+head(blood_toptable)
+sum(blood_toptable$FDR < 0.05)
+```
+
+There are 3916 significant genes found from the differential expression analysis.
+
+## Addition of gene symbols
+
+### Get gene symbols
+
+```{r}
+data_sorted <- data[sort(data$ensembl_gene_id,index.return=T)$ix,]
+data_sorted <- data_sorted[!duplicated(data_sorted$ensembl_gene_id),]
+```
+
+### Add gene symbols to `toptable`
+```{r}
+blood_toptable <- cbind(rownames(blood_toptable),blood_toptable)
+colnames(blood_toptable)[1] <- "Ensembl_gene_id"
+blood_toptable_sorted <- blood_toptable[sort(blood_toptable$Ensembl_gene_id,
+                                             index.return=T)$ix,]
+blood_data_sorted <- data_sorted[data_sorted$ensembl_gene_id %in% 
+                                   blood_toptable_sorted$Ensembl_gene_id,]
+dim(blood_toptable)
+dim(blood_data_sorted)
+blood_toptable_sorted$Gene_symbol <- blood_data_sorted$external_gene_name
+head(blood_toptable_sorted)
+```
+
+### Resort data
+```{r}
+blood_toptable <- blood_toptable_sorted[sort(blood_toptable_sorted$PValue,
+                                             index.return=T)$ix,]
+```
+
+## Explore and save results
+```{r}
+head(blood_toptable[,c(1,7,2,5,6)],10)
+write.table(blood_toptable,file="result/blood_toptable.txt",col.names=T,
+            row.names=F,sep="\t",quote=F)
+blood_toptable_sign <- blood_toptable[blood_toptable$FDR<0.05,]
+dim(blood_toptable_sign)
+```
+
+Around 10% of genes found in the data are significantly expressed.
+
+```{r}
+head(blood_toptable_sign,20)
+```
+
+## Plots
+### MA plot
+```{r}
+with(blood_toptable,plot(logCPM,logFC,pch=16,cex=0.2))
+# MAplot: all data points
+with(blood_toptable,points(logCPM[FDR<0.05],logFC[FDR<0.05],pch=16,col="red",cex=0.6))
+# MA-plot: significant loci
+abline(0,0)
+```
+
+There seems to be slightly more downregulated genes that is significant between healtyh donors and COVID-19 patients than upregulated genes.
+It can also be seen that there are a lot of significant genes.
+
+### P-value distribution
+```{r}
+hist(blood_toptable$PValue)
+```
+
+The p-value distribution is not uniformly distributed.
+
+### Boxplots of top 20 loci
+```{r}
+par(mfrow=c(4,5))
+blood_counts_k <- blood_txi$counts[blood_keep,]
+for (i in 1:20){
+  blood_counts_part <- as.numeric(edgeR::cpm(blood_y)[rownames(blood_counts_k)==
+                                                  rownames(blood_toptable)[i],])
+  blood_boxplot <- data.frame(counts=blood_counts_part,group=blood_condition)
+  if (blood_toptable$Gene_symbol[i]!=""){
+    boxplot(counts~group,blood_boxplot,main=paste(rownames(blood_toptable)[i], 
+                                                  " (", blood_toptable$Gene_symbol[i],
+                                                  ")",sep=""))
+  } else {
+    boxplot(counts~group,blood_boxplot,main=paste(rownames(blood_toptable)[i], 
+                                                  " (NA)", sep=""))
+  }
+}
+```
+
+The boxplots show that the the differentially expressed genes are indeed differentially expressed.
+In the first plot of `GIMPA4`, for example, there are no overlaps of the two box plots, and the two have around 300 count difference, with the gene underexpressed in COVID-19 patients.
+
+### Volcano plot
+
+```{r}
+with(blood_toptable,plot(logFC,-log10(PValue),pch=16,cex=0.2))
+with(blood_toptable,points(logFC[FDR<0.05 & abs(logFC)>1.5],
+                           -log10(PValue)[FDR<0.05 & abs(logFC)>1.5],pch=16,
+                           col="red",cex=0.6))
+abline(0,0)
+```
+
+The volcano plot shows that there is slightly more underexpression than overexpression for differentially expressed genes.
+
+### Heatmap
+```{r}
+blood_sigID <- blood_toptable_sign %>% rownames
+heatmap(blood_y$counts[blood_sigID,], main = colnames(blood_contrast), 
+        cex.main=.2)
+```
+
+# Gene set analysis
+
+From the differential expression analysis, we found a lot of differentially expressed genes. Therefore, we do further analysis with gene set analysis.
+Specifically, we make use of overrepresentation analysis (ORA).
+
+## Annotation
+
+For annotation, the `data` from Section 1, human annotation, is used.
+Duplicated ensembl gene IDs are removed and the data is saved in `.rda` file.
+```{r}
+if(!file.exists("RefGenes.Rda")){
+  refgenes <- data[!duplicated(data$ensembl_gene_id),]
+  refgenes <- refgenes[c("ensembl_gene_id")]
+  write.table(refgenes,file="RefGenes.txt", col.names=c("Ensembl_gene_id"), 
+              row.names=F, quote=F, sep='\t')
+} else{
+  load(refgenes, file="RefGenes.txt")
+}
+```
+
+## Gene set analysis using custom gene sets
+
+### Make `gmt` file for `WebGestaltR`
+
+The file format `gmt` should contain the gene sets.
+
+```{r}
+if (!file.exists("geneset_full.gmt")){
+  geneset <- read.csv("geneset_full.csv", header=F)
+  write.table(geneset, file="geneset_full.gmt",col.names=T,row.names=F,sep="\t",
+              quote=F,na="")
+}
+```
+
+### Run `WebGestaltR` using custom gene sets
+
+```{r, eval=FALSE}
+blood_enrichResult_full <- WebGestaltR(enrichMethod="ORA",
+                            organism="hsapiens",
+                            enrichDatabase="others",
+                            enrichDatabaseFile="geneset_full.gmt",
+                            enrichDatabaseType="genesymbol",
+                            interestGeneFile="result/blood_toptable.txt",
+                            interestGeneType="ensembl_gene_id",
+                            referenceGeneFile="RefGenes.txt",
+                            referenceGeneType="ensembl_gene_id",
+                            sigMethod="fdr",
+                            fdrThr=0.05,
+                            outputDirectory='result',
+                            projectName = 'ORA_blood',
+                            is.ouput=TRUE)
+```
+
+## Gene set analysis using KEGG pathway
+
+```{r, eval=FALSE}
+blood_enrichResult_kegg <- WebGestaltR(enrichMethod="ORA",
+                            organism="hsapiens",
+                            enrichDatabase="pathway_KEGG",
+                            interestGeneFile="result/blood_toptable.txt",
+                            interestGeneType="ensembl_gene_id",
+                            referenceGeneFile="RefGenes.txt",
+                            referenceGeneType="ensembl_gene_id",
+                            sigMethod="fdr",
+                            fdrThr=0.01,
+                            outputDirectory='result',
+                            projectName = 'ORA_blood_kegg_0.01',
+                            is.ouput=TRUE)
+```

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=00:40:00
+#PBS -l mem=8gb
+
+# Load the necessary modules
+module load FastQC/0.11.9-Java-11
+module load parallel-fastq-dump/0.6.6-GCCcore-9.3.0-SRA-Toolkit-3.0.0-Python-3.8.2
+
+Scratch=/kyukon/scratch/gent/vo/000/gvo00095/vsc45300
+
+# Change to the directory you are working in 
+cd /kyukon/data/gent/vo/000/gvo00095/group3/ChIPseq
+
+# Make a directory to store fastqc output
+mkdir fastqc_out
+
+
+# For loop over all samples
+for ID in SRR19522223 SRR19522224 SRR19522225 SRR19522226 SRR19522227 SRR19522212 SRR19522213 SRR19522214 SRR19522215 SRR19522216
+# This for loop will loop over the variables after "in" each time attributing the value SRRXXX as to $ID
+do 
+	# Echo the ID you are processing
+	echo $ID
+	
+	# Load the reads for the ID (--sra-id $ID) using 8 cores (--threads 8)
+	parallel-fastq-dump --split-files --outdir $Scratch --sra-id $ID --threads 8 | head
+	
+	# Perform QC with fastqc on the raw reads outputting everything in the fastqc folder (--outdir fastqc)
+	fastqc --outdir fastqc_out $Scratch/$ID\_1.fastq $Scratch/$ID\_2.fastq
+	
+	# Remove fastq files to reduce disk usage
+	#rm $Scratch/$ID\_1.fastq
+	#rm $Scratch/$ID\_2.fastq
+done

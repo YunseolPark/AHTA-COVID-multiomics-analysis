@@ -1,0 +1,398 @@
+---
+output:
+  pdf_document:
+    number_sections: true
+    dev: png
+    latex_engine: xelatex
+header-includes: \setlength{\emergencystretch}{3em}
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center')
+knitr::opts_chunk$set(out.width = '100%')
+knitr::opts_chunk$set(fig.width=12, fig.height=8)
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(message=FALSE)
+knitr::opts_chunk$set(error=TRUE)
+```
+
+# Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library("dplyr")
+  library("GEOquery")
+  library("GenomicRanges")
+  library("TxDb.Hsapiens.UCSC.hg38.knownGene")
+  library("org.Hs.eg.db")
+  library("DiffBind")
+})
+```
+
+# Load data
+
+## Peak data of mock treatment
+```{r}
+## Load and annotate data
+mock_beddata<-read.table("./Data/chipseq/Mock_peaks.broadPeak",header=F)
+colnames(mock_beddata)<-c("seqnames","start","end","id","score","strand",
+                          "enrichment","log10p","log10q")
+
+## Adjust strand data
+mock_beddata$seqnames <- paste0("chr", mock_beddata$seqnames)
+mock_beddata$strand<-as.factor("*")
+head(mock_beddata)
+dim(mock_beddata)
+write.table(mock_beddata,file="data/chipseq/Mock.bed",col.names = T,
+            row.names = F,quote = F,sep="\t")
+```
+
+## Peak data of Sars-Cov-2 infection
+```{r}
+## Load and annotate data
+covid_beddata<-read.table("./Data/chipseq/Cov_peaks.broadPeak",header=F)
+colnames(covid_beddata)<-c("seqnames","start","end","id","score","strand",
+                           "enrichment","log10p","log10q")
+
+## Adjust strand data
+covid_beddata$seqnames <- paste0("chr", covid_beddata$seqnames)
+covid_beddata$strand<-as.factor("*")
+head(covid_beddata)
+dim(covid_beddata)
+write.table(covid_beddata,file="data/chipseq/Cov.bed",col.names = T,
+            row.names = F,quote = F,sep="\t")
+```
+
+## Annotation
+
+Our interest lays in the differential prevalence of the H3Kac histone modification (per DNA region) between treatments.
+
+```{r, message=FALSE}
+chip_geo <- getGEO("GSE205369")
+chip_geo <- phenoData(chip_geo[["GSE205369_series_matrix.txt.gz"]])@data[c("title", "geo_accession")]
+chip_annotation <- read.table("chip_annotation.txt", header=T, sep=",")
+chip_annotation <- chip_annotation %>% dplyr::rename(geo_accession = `Library.Name`)
+chip_annotation <- dplyr::filter(chip_annotation, Run %in% c("SRR19522212",
+"SRR19522213","SRR19522214","SRR19522215","SRR19522216","SRR19522223",
+"SRR19522224","SRR19522225","SRR19522226","SRR19522227"))
+chip_geo <- chip_geo[chip_geo$geo_accession %in% chip_annotation$geo_accession,]
+chip_geo$title <- chip_geo$title %>% strsplit(" ") %>% vapply("[","",9)
+chip_geo <- chip_geo %>% dplyr::rename(replicate = `title`)
+chip_annotation <- merge(chip_annotation, chip_geo, "geo_accession")
+print(chip_annotation[c("Run", "chip_target", "Treatment", "Organism", 
+                    "Cell_type", "AvgSpotLen", "Instrument", "LibraryLayout")])
+```
+
+# Analysis
+
+Here, we try to find genes of interest.
+
+```{r}
+# Create GRanges objects
+mock_ChIPGR <- with(mock_beddata, 
+                    GRanges(seqnames, IRanges(start+1, end), strand, score, id, 
+                            enrichment, log10p, log10q))
+covid_ChIPGR <- with(covid_beddata,
+                     GRanges(seqnames, IRanges(start+1, end), strand, score, id, 
+                             enrichment, log10p, log10q))
+```
+
+```{r, message=FALSE}
+# Get gene data
+humangenes <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene)
+```
+
+```{r, warning=FALSE}
+# Get overlaps
+mock_ChIPgenes <- subsetByOverlaps(humangenes,mock_ChIPGR,ignore.strand=T)
+head(mock_ChIPgenes)
+covid_ChIPgenes <- subsetByOverlaps(humangenes,covid_ChIPGR,ignore.strand=T)
+head(covid_ChIPgenes)
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Gene annotation
+columns(org.Hs.eg.db)
+mock_ChIPgenes <- select(org.Hs.eg.db, mock_ChIPgenes$gene_id, 
+                         c("SYMBOL", "GENENAME"))
+colnames(mock_ChIPgenes) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+head(mock_ChIPgenes)
+covid_ChIPgenes <- select(org.Hs.eg.db, covid_ChIPgenes$gene_id, 
+                          c("SYMBOL", "GENENAME"))
+colnames(covid_ChIPgenes) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+head(covid_ChIPgenes)
+```
+
+```{r}
+# Write results to tables
+write.table(mock_ChIPgenes,file="result/mock_ChIPgenes.txt",col.names = T,
+            row.names = F,quote = F,sep="\t")
+write.table(covid_ChIPgenes,file="result/covid_ChIPgenes.txt",col.names = T,
+            row.names = F,quote = F,sep="\t")
+```
+
+```{r}
+# Find genes that are different between mock and control
+diff <- setdiff(covid_ChIPgenes$Gene_Symbol, mock_ChIPgenes$Gene_Symbol)
+head(diff)
+length(diff)
+```
+
+# Visualization
+
+```{r}
+# Subset only ones with correct chromosome names
+mock_subset <- mock_beddata[mock_beddata$seqnames %in% 
+                              paste0("chr", c(1:22, "X", "Y")),]
+mock_subset$strand <- "."
+covid_subset <- covid_beddata[covid_beddata$seqnames %in% 
+                                paste0("chr", c(1:22, "X", "Y")),]
+covid_subset$strand <- "."
+```
+
+```{r}
+# Make track files
+write('track type=broadPeak visibility=3 db=hg38 name="Mock" description="Mock treatment"', 
+      file = "result/Mock_track.broadPeak")
+write.table(mock_subset, file = "result/Mock_track.broadPeak", append=T, 
+            sep = "\t", quote=F, row.names=F, col.names=F)
+write('track type=broadPeak visibility=3 db=hg38 name="Covid" description="Covid treatment"', 
+      file = "result/Covid_track.broadPeak")
+write.table(covid_subset, file = "result/Covid_track.broadPeak", append=T, 
+            sep = "\t", quote=F, row.names=F, col.names=F)
+```
+
+# Differential Enrichment Analysis
+
+## Make `dba` object
+
+In the sections above, peak data of all replicates merged were used.
+For the differential enrichment analysis, the dba function required sample bam files and their respective peak files. Therefore, we make use of peaks created for each replicate, and the datasets are not exactly the same as the one found above.
+
+```{r, message=FALSE, warning=FALSE}
+if(file.exists('data/chipseq/sample_sheet.csv')){
+  sample_sheet <- read.table('data/chipseq/sample_sheet.csv', header=T, sep=',')
+} else {
+  samples <- chip_annotation[!chip_annotation$chip_target=='Input control',]
+  control <- chip_annotation[chip_annotation$chip_target=='Input control',]
+  treatment <- strsplit(samples$Treatment, ' ') %>% vapply('[', '', 1)
+  sample_sheet <- data.frame(SampleID = paste(treatment, samples$replicate, sep='.'),
+                             Factor = treatment,
+                             Tissue = samples$Cell_type,
+                             Condition = treatment,
+                             Replicate = strsplit(samples$replicate, 'r') %>% 
+                                         vapply('[','',2),
+                             bamReads = paste0('data/chipseq/', samples$Run, 
+                                               '_sored.bam'),
+                             bamControl = paste0('data/chipseq/', control$Run, 
+                                                 '_sored.bam'),
+                             ControlID = control$Run,
+                             Peaks = c("data/chipseq/Mock_r1_peaks.xls", 
+                                       "data/chipseq/Mock_r2_peaks.xls", 
+                                       "data/chipseq/Mock_r3_peaks.xls", 
+                                       "data/chipseq/Cov_r1_peaks.xls", 
+                                       "data/chipseq/Cov_r3_peaks.xls"),
+                             PeakCaller = unlist(lapply(1:5, function(x) "macs")),
+                             PeakFormat = unlist(lapply(1:5, function(x) "macs")))
+  write.table(sample_sheet, 'data/chipseq/sample_sheet.csv', col.names = T, 
+              row.names = F, quote = F, sep=',')
+}
+dbObj <- dba(sampleSheet = sample_sheet)
+
+dbObj[["peaks"]][[1]]$Chr <- paste0("chr", dbObj[["peaks"]][[1]]$Chr)
+dbObj[["peaks"]][[2]]$Chr <- paste0("chr", dbObj[["peaks"]][[2]]$Chr)
+dbObj[["peaks"]][[3]]$Chr <- paste0("chr", dbObj[["peaks"]][[3]]$Chr)
+dbObj[["peaks"]][[4]]$Chr <- paste0("chr", dbObj[["peaks"]][[4]]$Chr)
+dbObj[["peaks"]][[5]]$Chr <- paste0("chr", dbObj[["peaks"]][[5]]$Chr)
+
+dbObj
+```
+## Create affinity binding matrix
+
+```{r}
+dbObj <- dba.count(dbObj, bUseSummarizeOverlaps=TRUE)
+dbObj
+```
+
+## PCA
+
+```{r}
+dba.plotPCA(dbObj, attributes=DBA_FACTOR, label=DBA_ID)
+```
+
+```{r}
+plot(dbObj)
+```
+
+While there are correlations between Cov treated samples and mock treated samples, there seems to be more correlation between the replicates.
+
+## Make contrast
+
+The replicates are used as block effect.
+
+```{r}
+dbObj <- dba.contrast(dbObj, design=FALSE, categories=DBA_FACTOR, 
+                      block=DBA_REPLICATE, minMembers = 2)
+```
+
+## Analyze
+
+Greylist parameter was removed due to unknown reasons.
+
+```{r}
+dbObj <- dba.analyze(dbObj, method=DBA_ALL_METHODS, bGreylist=F)
+```
+
+## Result exploration
+
+### Contrast
+
+```{r}
+dba.show(dbObj, bContrasts=T)
+```
+
+### Plots
+
+```{r}
+jpeg("images/chip_pca.jpg")
+dba.plotPCA(dbObj, contrast=1, method=DBA_DESEQ2, attributes=DBA_FACTOR, label=DBA_ID)
+dev.off()
+```
+
+The PCA shows grouping of the mock treatment and cov2 treatment samples.
+
+```{r}
+dba.plotVenn(dbObj,contrast=1,method=DBA_ALL_METHODS)
+```
+
+```{r}
+dba.plotMA(dbObj, method=DBA_DESEQ2)
+```
+
+There is around 4-fold change for mock treatments compared to cov2 treatments in terms of change in binding affinity for significantly differentially bound sites.
+
+```{r}
+dba.plotMA(dbObj, bXY=TRUE)
+```
+
+The plot shows the same result as the previous one.
+
+```{r}
+pvals <- dba.plotBox(dbObj)
+```
+
+As seen from the MA plots, in the box plots, we also see that there is increased binding for the mock treatments and no increase of binding for Cov2 treatments.
+
+```{r}
+res_deseq <- dba.report(dbObj, method=DBA_DESEQ2, contrast = 1, th=1)
+res_deseq
+dim(res_deseq)
+dim(res_deseq[res_deseq$FDR < 0.05])
+out <- as.data.frame(res_deseq)
+write.table(out, file="result/MockvsCov_deseq2.txt", sep="\t", quote=F, row.names=F)
+```
+
+```{r}
+head(out)
+# Create bed files for each keeping only significant peaks (p < 0.05)
+mock_enrich <- out %>% filter(Fold > 0) 
+mock_write <- mock_enrich %>% 
+  filter(FDR < 0.05) %>% dplyr::select(seqnames, start, end)
+head(mock_write)
+# Write to file
+write.table(mock_write, file="result/Mock_enriched.bed", sep="\t", quote=F, 
+            row.names=F, col.names=F)
+# Create bed files for each keeping only significant peaks (p < 0.05)
+cov_enrich <- out %>% filter(Fold < 0)
+cov_write <- cov_enrich %>% 
+  filter(FDR < 0.05) %>%
+  dplyr::select(seqnames, start, end)
+head(cov_write)
+```
+
+## Find genes of interest
+
+
+The `humangenes` object was created in the previous section.
+
+```{r}
+mock_enrich$seqnames <- paste0("chr",mock_enrich$seqnames)
+cov_enrich$seqnames <- paste0("chr",cov_enrich$seqnames)
+#GRanges object of the mock treatment and cov2 treatment
+mock_result <- makeGRangesFromDataFrame(mock_enrich)
+cov_result <- makeGRangesFromDataFrame(cov_enrich)
+# GRanges object with FDR below 0.05
+mock_result_sig <- makeGRangesFromDataFrame(mock_enrich %>% filter(FDR < 0.05))
+cov_result_sig <- makeGRangesFromDataFrame(cov_enrich %>% filter(FDR < 0.05))
+```
+
+```{r, warning=FALSE}
+# Get overlaps
+mock_result_genes <- subsetByOverlaps(humangenes,mock_result,ignore.strand=T)
+head(mock_result_genes)
+cov_result_genes <- subsetByOverlaps(humangenes,cov_result,ignore.strand=T)
+head(cov_result_genes)
+mock_result_genes_sig <- subsetByOverlaps(humangenes,mock_result_sig,ignore.strand=T)
+head(mock_result_genes_sig)
+cov_result_genes_sig <- subsetByOverlaps(humangenes,cov_result_sig,ignore.strand=T)
+head(cov_result_genes_sig)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Gene annotation
+mock_result_genes <- select(org.Hs.eg.db, mock_result_genes$gene_id, 
+                            c("SYMBOL", "GENENAME"))
+colnames(mock_result_genes) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+head(mock_result_genes)
+cov_result_genes <- select(org.Hs.eg.db, cov_result_genes$gene_id, 
+                           c("SYMBOL", "GENENAME"))
+colnames(cov_result_genes) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+head(cov_result_genes)
+mock_result_genes_sig <- select(org.Hs.eg.db, mock_result_genes_sig$gene_id, 
+                                c("SYMBOL", "GENENAME"))
+colnames(mock_result_genes_sig) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+head(mock_result_genes_sig)
+cov_result_genes_sig <- select(org.Hs.eg.db, cov_result_genes_sig$gene_id,
+                               c("SYMBOL", "GENENAME"))
+colnames(cov_result_genes_sig) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+head(cov_result_genes_sig)
+```
+
+```{r}
+# Write results to tables
+write.table(mock_result_genes,file="result/mock_result_genes.txt",col.names = T,
+            row.names = F,quote = F,sep="\t")
+write.table(mock_result_genes_sig,file="result/mock_result_genes_sig.txt",
+            col.names = T,row.names = F,quote = F,sep="\t")
+```
+
+```{r}
+# Find genes that are different between mock and control
+different <- setdiff(cov_result_genes$Gene_Symbol, mock_result_genes$Gene_Symbol)
+head(different)
+length(different)
+```
+
+## Visualization
+
+```{r}
+# Subset those with correct chromosome names
+mock_resultSUB <- mock_enrich[mock_enrich$seqnames 
+                              %in% paste0("chr", c(1:22, "X", "Y")),]
+covid_resultSUB <- cov_enrich[cov_enrich$seqnames 
+                              %in% paste0("chr", c(1:22, "X", "Y")),]
+```
+
+```{r}
+# Make track files
+write('track name="Mock" description="Mock treatment" visibility=3 db=hg38', 
+      file = "result/MockDE_track.broadPeak")
+write.table(mock_resultSUB[c("seqnames", "start", 'end')],
+            file = "result/MockDE_track.broadPeak", append=T, 
+            sep = "\t", quote=F, row.names=F, col.names=F)
+write('track name="Covid" description="Covid treatment" visibility=3 db=hg38', 
+      file = "result/CovidDE_track.broadPeak")
+write.table(covid_resultSUB[c("seqnames", "start", 'end')],
+            file = "result/CovidDE_track.broadPeak", append=T, 
+            sep = "\t", quote=F, row.names=F, col.names=F)
+```
